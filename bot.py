@@ -184,11 +184,22 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 # ------------------- MAIN LOOP -------------------
+# async def main():
+#     app = Application.builder().token(TELEGRAM_TOKEN).build()
+#     app.add_handler(CommandHandler("start", start))
+#     app.add_handler(CommandHandler("check", check))
+#     await app.run_polling()
+
+# if __name__ == "__main__":
+#     asyncio.run(main())
+# ------------------- MAIN LOOP -------------------
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", check))
-    await app.run_polling()
+    await app.run_polling()  # keep polling forever
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(main())  # remove asyncio.run()
+
