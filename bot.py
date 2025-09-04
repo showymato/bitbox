@@ -1,158 +1,194 @@
-import asyncio
-import json
 import os
+import json
 import logging
-import requests
+import asyncio
 import ccxt
 import numpy as np
-from datetime import datetime
-from telegram import Bot
-from typing import List
+import pandas as pd
+from datetime import datetime, timezone
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ------------------- CONFIG -------------------
+SYMBOL = "BTC/USDT"
+TIMEFRAME = "5m"
+LIMIT = 500
 
-class ScalperBot5Min:
-    def __init__(self, telegram_token: str, allowed_chat_ids: List[int]):
-        self.token = telegram_token
-        self.allowed_chat_ids = allowed_chat_ids
-        # ✅ Use Bybit instead of Binance (works in restricted regions)
-        self.exchange = ccxt.bybit()
-        self.symbol = 'BTC/USDT'
-        self.timeframe = '5m'
-        self.closes = []
-        self.highs = []
-        self.lows = []
-        self.volumes = []
-        self.in_position = False
-        self.position_side = None
-        self.entry_price = None
+SESSION_FILTER = True
+SESSION_START_UTC = 7   # 07:00 UTC (London open)
+SESSION_END_UTC   = 20  # 20:00 UTC (NY close)
 
-    def fetch_historical_data(self):
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe=self.timeframe, limit=200)
-            self.closes = [candle[4] for candle in ohlcv]
-            self.highs = [candle[2] for candle in ohlcv]
-            self.lows = [candle[3] for candle in ohlcv]
-            self.volumes = [candle[5] for candle in ohlcv]
-            logger.info('✅ Fetched historical data from Bybit')
-        except Exception as e:
-            logger.error(f'Error fetching historical data: {e}')
+STATE_FILE = "config.json"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ALLOWED_CHAT_IDS = [int(cid) for cid in os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if cid]
 
-    def ema(self, prices: List[float], period: int) -> List[float]:
-        ema_values = []
-        k = 2 / (period + 1)
-        for i in range(len(prices)):
-            if i < period - 1:
-                ema_values.append(None)
-            elif i == period - 1:
-                sma = sum(prices[:period]) / period
-                ema_values.append(sma)
-            else:
-                ema = (prices[i] - ema_values[-1]) * k + ema_values[-1]
-                ema_values.append(ema)
-        return ema_values
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ScalperBot")
 
-    def rsi(self, prices: List[float], period: int = 14) -> List[float]:
-        deltas = np.diff(prices)
-        seed = deltas[:period]
-        up = seed[seed >= 0].sum() / period
-        down = -seed[seed < 0].sum() / period
-        rs = up / down if down != 0 else 0
-        rsi = np.zeros_like(prices)
-        rsi[:period] = 100. - 100. / (1. + rs)
-        for i in range(period, len(prices)):
-            delta = deltas[i - 1]
-            upval = max(delta, 0)
-            downval = -min(delta, 0)
-            up = (up * (period - 1) + upval) / period
-            down = (down * (period - 1) + downval) / period
-            rs = up / down if down != 0 else 0
-            rsi[i] = 100. - 100. / (1. + rs)
-        return rsi
+# ------------------- HELPERS -------------------
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"open_trade": None}
 
-    def atr(self, highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[float]:
-        trs = []
-        for i in range(1, len(closes)):
-            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-            trs.append(tr)
-        atr = [0] * (period)
-        for i in range(period, len(trs)):
-            atr.append(np.mean(trs[i-period:i]))
-        return atr
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
-    async def send_telegram(self, message: str):
-        try:
-            bot = Bot(token=self.token)
-            for chat_id in self.allowed_chat_ids:
-                await bot.send_message(chat_id=chat_id, text=message)
-        except Exception as e:
-            logger.error(f'Failed to send telegram message: {e}')
+def utc_hour():
+    return datetime.now(timezone.utc).hour
 
-    async def analyze_and_trade(self):
-        if len(self.closes) < 50:
-            return
-        ema7 = self.ema(self.closes, 7)[-1]
-        ema21 = self.ema(self.closes, 21)[-1]
-        rsi_last = self.rsi(self.closes)[-1]
-        atr_last = self.atr(self.highs, self.lows, self.closes)[-1]
-        price = self.closes[-1]
+# ------------------- STRATEGY -------------------
+class Scalper:
+    def __init__(self):
+        self.exchange = ccxt.binance({"enableRateLimit": True})
+        self.state = load_state()
 
-        # Entry Logic
-        if not self.in_position:
-            if ema7 and ema21 and rsi_last:
-                if ema7 > ema21 and rsi_last < 60:
-                    sl = price - atr_last
-                    tp = price + atr_last * 1.5
-                    self.in_position = True
-                    self.position_side = 'BUY'
-                    self.entry_price = price
-                    msg = f"🟢 BUY {price:.2f} SL {sl:.2f} TP {tp:.2f}"
-                    await self.send_telegram(msg)
-                elif ema7 < ema21 and rsi_last > 40:
-                    sl = price + atr_last
-                    tp = price - atr_last * 1.5
-                    self.in_position = True
-                    self.position_side = 'SELL'
-                    self.entry_price = price
-                    msg = f"🔴 SELL {price:.2f} SL {sl:.2f} TP {tp:.2f}"
-                    await self.send_telegram(msg)
+    async def fetch_ohlcv(self):
+        ohlcv = await self.exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
+        df = pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        return df
 
-        # Exit Logic
-        elif self.in_position:
-            if self.position_side == 'BUY' and price <= self.entry_price - atr_last:
-                self.in_position = False
-                msg = f"🔺 EXIT BUY at {price:.2f} - Stop Loss hit"
-                await self.send_telegram(msg)
-            elif self.position_side == 'BUY' and price >= self.entry_price + atr_last * 1.5:
-                self.in_position = False
-                msg = f"✅ EXIT BUY at {price:.2f} - Take Profit hit"
-                await self.send_telegram(msg)
-            elif self.position_side == 'SELL' and price >= self.entry_price + atr_last:
-                self.in_position = False
-                msg = f"🔺 EXIT SELL at {price:.2f} - Stop Loss hit"
-                await self.send_telegram(msg)
-            elif self.position_side == 'SELL' and price <= self.entry_price - atr_last * 1.5:
-                self.in_position = False
-                msg = f"✅ EXIT SELL at {price:.2f} - Take Profit hit"
-                await self.send_telegram(msg)
+    def indicators(self, df):
+        df["ema9"] = df["c"].ewm(span=9).mean()
+        df["ema21"] = df["c"].ewm(span=21).mean()
+        df["ema50"] = df["c"].ewm(span=50).mean()
+        df["ema200"] = df["c"].ewm(span=200).mean()
+        df["rsi"] = self.rsi(df["c"], 14)
+        df["atr"] = self.atr(df, 14)
+        df["vwap"] = (df["c"] * df["v"]).cumsum() / df["v"].cumsum()
+        df["vol_avg"] = df["v"].rolling(20).mean()
+        return df
 
+    def rsi(self, series, period=14):
+        delta = series.diff()
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = pd.Series(gain).rolling(period).mean()
+        avg_loss = pd.Series(loss).rolling(period).mean()
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
 
-async def main():
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-    ALLOWED_CHAT_IDS = os.getenv('ALLOWED_CHAT_IDS', '')
-    if not TELEGRAM_TOKEN or not ALLOWED_CHAT_IDS:
-        logger.error('Missing TELEGRAM_TOKEN or ALLOWED_CHAT_IDS environment variables')
+    def atr(self, df, period=14):
+        hl = df["h"] - df["l"]
+        hc = abs(df["h"] - df["c"].shift())
+        lc = abs(df["l"] - df["c"].shift())
+        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+        return tr.rolling(period).mean()
+
+    def entry_signal(self, df):
+        row = df.iloc[-1]
+        if SESSION_FILTER and not (SESSION_START_UTC <= utc_hour() <= SESSION_END_UTC):
+            return None
+
+        # Long
+        if row["ema9"] > row["ema21"] and row["ema21"] > row["ema50"]:
+            if row["c"] > row["vwap"] and 40 < row["rsi"] < 65 and row["v"] > row["vol_avg"]:
+                return {"side": "BUY", "price": row["c"], "atr": row["atr"]}
+        # Short
+        if row["ema9"] < row["ema21"] and row["ema21"] < row["ema50"]:
+            if row["c"] < row["vwap"] and 35 < row["rsi"] < 60 and row["v"] > row["vol_avg"]:
+                return {"side": "SELL", "price": row["c"], "atr": row["atr"]}
+        return None
+
+    def exit_signal(self, df):
+        trade = self.state.get("open_trade")
+        if not trade:
+            return None
+
+        row = df.iloc[-1]
+        price = row["c"]
+        atr = trade["atr"]
+
+        if trade["side"] == "BUY":
+            # SL
+            if price <= trade["entry"] - atr:
+                return {"exit": "SL hit", "price": price}
+            # TP
+            if price >= trade["entry"] + 2*atr:
+                return {"exit": "TP hit", "price": price}
+            # RSI extreme
+            if row["rsi"] > 75:
+                return {"exit": "RSI extreme", "price": price}
+            # Trailing stop
+            if price - trade["entry"] >= atr:
+                ts = trade.get("trailing_stop", trade["entry"])
+                new_ts = max(ts, price - atr)
+                trade["trailing_stop"] = new_ts
+                save_state(self.state)
+                if price <= new_ts:
+                    return {"exit": "Trailing Stop", "price": price}
+
+        if trade["side"] == "SELL":
+            # SL
+            if price >= trade["entry"] + atr:
+                return {"exit": "SL hit", "price": price}
+            # TP
+            if price <= trade["entry"] - 2*atr:
+                return {"exit": "TP hit", "price": price}
+            # RSI extreme
+            if row["rsi"] < 25:
+                return {"exit": "RSI extreme", "price": price}
+            # Trailing stop
+            if trade["entry"] - price >= atr:
+                ts = trade.get("trailing_stop", trade["entry"])
+                new_ts = min(ts, price + atr)
+                trade["trailing_stop"] = new_ts
+                save_state(self.state)
+                if price >= new_ts:
+                    return {"exit": "Trailing Stop", "price": price}
+
+        return None
+
+# ------------------- TELEGRAM HANDLERS -------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id not in ALLOWED_CHAT_IDS:
+        return
+    await update.message.reply_text("🤖 Scalper Bot running with full entry/exit logic!")
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id not in ALLOWED_CHAT_IDS:
+        return
+    bot = Scalper()
+    df = await bot.fetch_ohlcv()
+    df = bot.indicators(df)
+
+    # Check exit first
+    exit_sig = bot.exit_signal(df)
+    if exit_sig:
+        bot.state["open_trade"] = None
+        save_state(bot.state)
+        msg = f"❌ EXIT {exit_sig['exit']} @ {exit_sig['price']:.2f}"
+        await update.message.reply_text(msg)
         return
 
-    allowed_ids = [int(x) for x in ALLOWED_CHAT_IDS.split(",")]
-    bot = ScalperBot5Min(TELEGRAM_TOKEN, allowed_ids)
+    # Otherwise check entry
+    if not bot.state.get("open_trade"):
+        entry_sig = bot.entry_signal(df)
+        if entry_sig:
+            bot.state["open_trade"] = {
+                "side": entry_sig["side"],
+                "entry": entry_sig["price"],
+                "atr": entry_sig["atr"]
+            }
+            save_state(bot.state)
+            msg = f"✅ ENTRY {entry_sig['side']} @ {entry_sig['price']:.2f} | ATR={entry_sig['atr']:.2f}"
+        else:
+            msg = "⚠️ No new signal."
+    else:
+        trade = bot.state["open_trade"]
+        msg = f"📈 Holding {trade['side']} from {trade['entry']:.2f} | ATR={trade['atr']:.2f}"
 
-    bot.fetch_historical_data()
+    await update.message.reply_text(msg)
 
-    while True:
-        await bot.analyze_and_trade()
-        await asyncio.sleep(300)  # Every 5 minutes
+# ------------------- MAIN LOOP -------------------
+async def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("check", check))
+    await app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
