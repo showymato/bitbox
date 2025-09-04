@@ -1,0 +1,5 @@
+ccxt>=4.3.0
+python-telegram-bot>=21.4
+requests>=2.31.0
+websocket-client>=1.8.0
+cryptography>=42.0.0
