@@ -1,18 +1,14 @@
 services:
   - type: web
-    name: bitcoin-trading-bot
+    name: crypto-scalper-bot
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
     plan: free
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
-      - key: ALLOWED_CHAT_IDS
-        value: ""
-      - key: USE_TESTNET
-        value: "true"
-      - key: RISK_PER_TRADE
-        value: "1.0"
-      - key: ENCRYPTION_KEY
-        generateValue: true
+      - key: TELEGRAM_CHAT_IDS
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
