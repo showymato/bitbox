@@ -1,7 +1,13 @@
-ccxt>=4.3.0
-python-telegram-bot>=21.4
-requests>=2.31.0
-websocket-client>=1.8.0
-cryptography>=42.0.0
-numpy>=1.24.0
-pandas>=2.0.0
+# Production Crypto Trading Bot Requirements
+# Python 3.11+ compatible
+
+# Core trading libraries
+ccxt==4.1.47
+pandas==2.1.4
+numpy==1.25.2
+
+# Telegram bot
+python-telegram-bot==20.7
+
+# Utilities
+python-dateutil==2.8.2
